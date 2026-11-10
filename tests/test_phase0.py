@@ -9,8 +9,10 @@ import tarfile
 import unittest
 from pathlib import Path
 
+from src.explore.profile import Profile, classify_ip, local_time_to_epoch, profile_documents
 from src.explore.sketch import HyperLogLog
 from src.stream.tar_bson import SummaryDump, parse_tar_header, parse_tar_size
+
 
 def bdoc(items: list[tuple[str, object]]) -> bytes:
     body = bytearray()
@@ -51,6 +53,7 @@ def bdoc(items: list[tuple[str, object]]) -> bytes:
             raise TypeError(type(value))
     body.append(0)
     return struct.pack("<i", len(body) + 4) + bytes(body)
+
 
 class TarSizeTest(unittest.TestCase):
     def test_octal_and_gnu_base256(self) -> None:
@@ -110,7 +113,79 @@ class TarSizeTest(unittest.TestCase):
         header = info.tobuf(format=tarfile.USTAR_FORMAT)[:512]
         self.assertEqual(parse_tar_header(header), ("dump/countly/summary.bson", 1234, "0"))
 
+
+class ProfileTest(unittest.TestCase):
+    def test_nullish_ip_and_cart_product_without_leaking_email(self) -> None:
+        secret = "secret@example.com"
+        docs = [
+            bdoc(
+                [
+                    ("_id", b"\x11" * 12),
+                    ("collection", "view_product_detail"),
+                    ("ip", "8.8.8.8"),
+                    ("product_id", "110474"),
+                    ("current_url", f"https://www.glamira.co.uk/ring.html?email={secret}"),
+                    ("email_address", secret),
+                    ("user_agent", "Agent/Secret"),
+                    ("show_recommendation", "false"),
+                    ("time_stamp", 1_591_266_092),
+                    ("local_time", "2020-06-04 12:21:32"),
+                    ("store_id", "12"),
+                    ("device_id", "device-a"),
+                ]
+            ),
+            bdoc(
+                [
+                    ("_id", b"\x22" * 12),
+                    ("collection", "view_home_page"),
+                    ("ip", ""),
+                    ("show_recommendation", False),
+                    ("store_id", "12"),
+                ]
+            ),
+            bdoc(
+                [
+                    ("_id", b"\x33" * 12),
+                    ("collection", "checkout"),
+                    ("ip", "10.1.2.3"),
+                    ("cart_products", [{"product_id": 7}]),
+                    ("current_url", "https://www.glamira.de/checkout/"),
+                ]
+            ),
+        ]
+        profile = profile_documents(docs, source="memory", sample_size=0)
+        home = profile.nullish["view_home_page"]
+        self.assertEqual(home["ip"], 1)
+        self.assertEqual(home["product_id"], 1)
+        detail = profile.nullish["view_product_detail"]
+        self.assertEqual(detail["product_id"], 0)
+        self.assertEqual(detail["ip"], 0)
+        self.assertEqual(profile.product_link_by_event["checkout"], 1)
+        self.assertEqual(profile.cart_with_product_id, 1)
+        self.assertEqual(profile.html_by_event["view_product_detail"], 1)
+        self.assertEqual(profile.ip_class["public"], 1)
+        self.assertEqual(profile.ip_class["empty"], 1)
+        self.assertEqual(profile.ip_class["private"], 1)
+        self.assertEqual(profile.hosts["www.glamira.co.uk"], 1)
+        self.assertEqual(profile.exact_dup_prefix_dups, 0)
+
+    def test_duplicate_prefix_id(self) -> None:
+        document = bdoc([("_id", b"\x44" * 12), ("collection", "x")])
+        profile = profile_documents([document, document], source="memory")
+        self.assertEqual(profile.exact_dup_prefix_dups, 1)
+
 class HelperTest(unittest.TestCase):
+    def test_ip_and_local_time(self) -> None:
+        self.assertEqual(classify_ip(b"8.8.8.8"), "public")
+        self.assertEqual(classify_ip(b"192.168.0.1"), "private")
+        self.assertEqual(classify_ip(b"127.0.0.1"), "loopback")
+        self.assertEqual(classify_ip(b"not-an-ip"), "invalid")
+        from datetime import datetime, timezone
+
+        expected = int(datetime(2020, 6, 4, 8, 20, 4, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(local_time_to_epoch(b"2020-06-04 8:20:4"), expected)
+        self.assertIsNone(local_time_to_epoch(b"04/06/2020 08:20:04"))
+
     def test_hll_orders_of_magnitude(self) -> None:
         sketch = HyperLogLog()
         for index in range(3000):
