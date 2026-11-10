@@ -9,6 +9,7 @@ import tarfile
 import unittest
 from pathlib import Path
 
+from src.explore.sketch import HyperLogLog
 from src.stream.tar_bson import SummaryDump, parse_tar_header, parse_tar_size
 
 def bdoc(items: list[tuple[str, object]]) -> bytes:
@@ -109,6 +110,18 @@ class TarSizeTest(unittest.TestCase):
         header = info.tobuf(format=tarfile.USTAR_FORMAT)[:512]
         self.assertEqual(parse_tar_header(header), ("dump/countly/summary.bson", 1234, "0"))
 
+class HelperTest(unittest.TestCase):
+    def test_hll_orders_of_magnitude(self) -> None:
+        sketch = HyperLogLog()
+        for index in range(3000):
+            sketch.add(f"id-{index}".encode())
+        estimate = sketch.estimate()
+        self.assertGreater(estimate, 2400)
+        self.assertLess(estimate, 3600)
+        repeated = HyperLogLog()
+        for _ in range(1000):
+            repeated.add(b"same")
+        self.assertLess(repeated.estimate(), 5)
 
 if __name__ == "__main__":
     unittest.main()
