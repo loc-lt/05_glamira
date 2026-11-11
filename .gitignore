@@ -1,8 +1,29 @@
+# secrets and local env
 .env
 .venv/
+.uv/
+.python-version
+
+# bytecode / test caches
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# local data — never commit the dump, BIN, or extracts
 data/
 *.tar.gz
+*.tgz
+*.zip
 *.bson
 *.BIN
+*.bin
+
+# editor
+.DS_Store
+.idea/
+.vscode/
+
+# GCP settings for infra/gcp scripts
+infra/gcp/gcp.env
