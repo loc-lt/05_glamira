@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import gzip
 import io
+import json
 import struct
 import tarfile
 import unittest
 from pathlib import Path
 
 from src.explore.profile import Profile, classify_ip, local_time_to_epoch, profile_documents
+from src.explore.render import render_null_profile, render_quality_report
 from src.explore.sketch import HyperLogLog
-from src.stream.tar_bson import SummaryDump, parse_tar_header, parse_tar_size
+from src.stream.bson_lite import iter_fields
+from src.stream.tar_bson import SummaryDump, parse_tar_size
 
 
 def bdoc(items: list[tuple[str, object]]) -> bytes:
@@ -53,6 +56,63 @@ def bdoc(items: list[tuple[str, object]]) -> bytes:
             raise TypeError(type(value))
     body.append(0)
     return struct.pack("<i", len(body) + 4) + bytes(body)
+
+
+class BsonLiteTest(unittest.TestCase):
+    def test_reads_field_after_nested_document(self) -> None:
+        document = bdoc(
+            [
+                ("collection", "view_listing_page"),
+                ("option", {"alloy": ""}),
+                ("device_id", "device-ok"),
+                ("after", "skipped-text"),
+                ("cat_id", None),
+                ("flag", False),
+            ]
+        )
+        fields = dict(iter_fields(document))
+        self.assertEqual(fields["device_id"].raw, b"device-ok")
+        self.assertEqual(fields["after"].kind, "str")
+        self.assertIsNone(fields["after"].raw)
+        self.assertFalse(fields["after"].nullish)
+        self.assertTrue(fields["cat_id"].nullish)
+        self.assertFalse(fields["flag"].nullish)
+        self.assertFalse(fields["flag"].flag)
+        self.assertTrue(fields["option"].kind == "doc")
+
+    def test_empty_string_is_nullish_without_copying_unneeded_text(self) -> None:
+        document = bdoc(
+            [
+                ("collection", "view_home_page"),
+                ("email_address", "secret@example.com"),
+                ("user_agent", "VeryLongAgent/1.0"),
+                ("ip", ""),
+            ]
+        )
+        fields = dict(iter_fields(document))
+        self.assertIsNone(fields["email_address"].raw)
+        self.assertFalse(fields["email_address"].nullish)
+        self.assertIsNone(fields["user_agent"].raw)
+        self.assertTrue(fields["ip"].nullish)
+
+    def test_int64_and_object_id_do_not_desync_parser(self) -> None:
+        body = bytearray()
+        body.append(0x12)
+        body += b"time_stamp\x00"
+        body += struct.pack("<q", 1_591_266_092)
+        body.append(0x07)
+        body += b"_id\x00"
+        body += b"\x5e\xd8\xcb\x2a" + b"\x00" * 8
+        body.append(0x02)
+        body += b"collection\x00"
+        raw = b"checkout\x00"
+        body += struct.pack("<i", len(raw))
+        body += raw
+        body.append(0)
+        document = struct.pack("<i", len(body) + 4) + bytes(body)
+        fields = dict(iter_fields(document))
+        self.assertEqual(fields["time_stamp"].number, 1_591_266_092)
+        self.assertEqual(fields["collection"].raw, b"checkout")
 
 
 class TarSizeTest(unittest.TestCase):
@@ -105,13 +165,6 @@ class TarSizeTest(unittest.TestCase):
         path = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(path))
         return path
-
-    def test_header_name_size_type(self) -> None:
-        # tarfile build a real 512 byte ustar header to test your read function.
-        info = tarfile.TarInfo(name="dump/countly/summary.bson")
-        info.size = 1234
-        header = info.tobuf(format=tarfile.USTAR_FORMAT)[:512]
-        self.assertEqual(parse_tar_header(header), ("dump/countly/summary.bson", 1234, "0"))
 
 
 class ProfileTest(unittest.TestCase):
@@ -168,11 +221,33 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(profile.ip_class["private"], 1)
         self.assertEqual(profile.hosts["www.glamira.co.uk"], 1)
         self.assertEqual(profile.exact_dup_prefix_dups, 0)
+        rendered = render_quality_report(profile) + render_null_profile(profile)
+        blob = json.dumps(profile.to_dict())
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn(secret, blob)
+        self.assertNotIn("Agent/Secret", blob)
+        self.assertIn("www.glamira.co.uk", blob)
+        leaked = bdoc(
+            [
+                ("collection", "view_home_page"),
+                ("show_recommendation", "erToken=SECRETVALUE123"),
+                ("api_version", "1.0"),
+            ]
+        )
+        leaked_profile = profile_documents([leaked], source="memory")
+        leaked_blob = json.dumps(leaked_profile.to_dict())
+        self.assertNotIn("SECRETVALUE123", leaked_blob)
+        self.assertEqual(leaked_profile.value_counts["show_recommendation"]["(other)"], 1)
+        roundtrip = profile.to_dict()
+        restored = Profile.from_dict(roundtrip)
+        self.assertEqual(restored.docs_scanned, profile.docs_scanned)
+        self.assertEqual(restored.offset_hours, profile.offset_hours)
 
     def test_duplicate_prefix_id(self) -> None:
         document = bdoc([("_id", b"\x44" * 12), ("collection", "x")])
         profile = profile_documents([document, document], source="memory")
         self.assertEqual(profile.exact_dup_prefix_dups, 1)
+
 
 class HelperTest(unittest.TestCase):
     def test_ip_and_local_time(self) -> None:
@@ -197,6 +272,7 @@ class HelperTest(unittest.TestCase):
         for _ in range(1000):
             repeated.add(b"same")
         self.assertLess(repeated.estimate(), 5)
+
 
 if __name__ == "__main__":
     unittest.main()
