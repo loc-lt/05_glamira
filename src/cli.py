@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from src.config import Settings
+from src.enrich.ip_lookup import load_ip_geo
 from src.explore.profile import profile_tar
 from src.explore.render import render_data_dictionary, render_null_profile, render_quality_report
 from src.ingest.load_mongo import load_tar
@@ -44,6 +45,13 @@ def main(argv: list[str] | None = None) -> int:
     load_cmd.set_defaults(progress_every=100_000)
     load_cmd.set_defaults(handler=_load_mongo)
 
+    enrich = sub.add_parser("enrich", help="IP lookup and product crawl")
+    enrich_cmds = enrich.add_subparsers(dest="command", required=True)
+    ip_cmd = enrich_cmds.add_parser("ip", help="Lookup distinct IPs and write coverage")
+    ip_cmd.add_argument("--counts", default="data/staging/ip_event_counts.tsv")
+    ip_cmd.add_argument("--checkout-counts", default="data/staging/checkout_success_ips.tsv")
+    ip_cmd.add_argument("--out", default="docs/ip_coverage.md")
+    ip_cmd.set_defaults(handler=_enrich_ip)
 
     args = parser.parse_args(argv)
     try:
@@ -132,6 +140,21 @@ def _load_mongo(args: argparse.Namespace) -> int:
         if not result.count_matches:
             return 3
     return 0 if not result.stopped_for_disk else 2
+
+
+def _enrich_ip(args: argparse.Namespace) -> int:
+    coverage = load_ip_geo(
+        Settings.from_env(),
+        counts_path=args.counts,
+        checkout_path=args.checkout_counts,
+        out_md=args.out,
+    )
+    print(
+        f"public resolve {coverage.resolved_pct:.2f}% "
+        f"checkout_success {coverage.checkout_pct:.2f}% "
+        f"wrote {args.out}"
+    )
+    return 0
 
 
 def _write(path: str, text: str) -> None:
