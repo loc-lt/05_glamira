@@ -10,6 +10,7 @@ from pathlib import Path
 from src.config import Settings
 from src.explore.profile import profile_tar
 from src.explore.render import render_data_dictionary, render_null_profile, render_quality_report
+from src.ingest.load_mongo import load_tar
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,6 +35,14 @@ def main(argv: list[str] | None = None) -> int:
     quality_cmd.add_argument("--dictionary-out", default="docs/data_dictionary.md")
     quality_cmd.add_argument("--stats-out", default="data/staging/profile_stats.json")
     quality_cmd.set_defaults(handler=_quality_report)
+
+    ingest = sub.add_parser("ingest", help="Load the mongodump into MongoDB")
+    ingest_cmds = ingest.add_subparsers(dest="command", required=True)
+    load_cmd = ingest_cmds.add_parser("load-mongo", help="Stream summary.bson into glamira_raw")
+    _add_scan_args(load_cmd)
+    load_cmd.add_argument("--limit", type=int, default=0, help="Stop after N documents. 0 loads the member.")
+    load_cmd.set_defaults(progress_every=100_000)
+    load_cmd.set_defaults(handler=_load_mongo)
 
 
     args = parser.parse_args(argv)
@@ -102,6 +111,27 @@ def _quality_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_mongo(args: argparse.Namespace) -> int:
+    settings = Settings.from_env()
+    result = load_tar(
+        _resolve_path(args.path),
+        settings,
+        limit=args.limit or args.sample_size,
+        progress_every=args.progress_every,
+    )
+    print(
+        f"scanned={result.docs_scanned:,} inserted={result.inserted:,} "
+        f"duplicates={result.duplicates:,} mongo_count={result.mongo_count:,} "
+        f"completed={result.completed_member} disk_stop={result.stopped_for_disk} "
+        f"elapsed={result.elapsed_seconds:.1f}s"
+    )
+    if result.completed_member:
+        print(f"ip counts: {result.ip_count_path} ({result.distinct_ips:,} distinct)")
+        verdict = "MATCH" if result.count_matches else "MISMATCH"
+        print(f"count check: source={result.docs_scanned:,} mongo={result.mongo_count:,} {verdict}")
+        if not result.count_matches:
+            return 3
+    return 0 if not result.stopped_for_disk else 2
 
 
 def _write(path: str, text: str) -> None:
