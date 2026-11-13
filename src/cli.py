@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from src.config import Settings
+from src.enrich.crawl import crawl_seed
 from src.enrich.extract_products import extract_products
 from src.enrich.ip_lookup import load_ip_geo
 from src.explore.profile import profile_tar
@@ -60,6 +61,11 @@ def main(argv: list[str] | None = None) -> int:
     extract_cmd.add_argument("--per-event", type=int, default=0, help="0 reads every document of each event.")
     extract_cmd.add_argument("--out", default="data/exports/product_urls.csv")
     extract_cmd.set_defaults(handler=_extract_products)
+    crawl_cmd = enrich_cmds.add_parser("crawl", help="Fetch canonical product pages")
+    crawl_cmd.add_argument("--seed", default="data/exports/product_urls.csv")
+    crawl_cmd.add_argument("--limit", type=int, default=100, help="First N seed rows. 0 reads the whole seed.")
+    crawl_cmd.add_argument("--out", default="docs/crawl_pilot.md")
+    crawl_cmd.set_defaults(handler=_enrich_crawl)
     args = parser.parse_args(argv)
     try:
         return int(args.handler(args))
@@ -184,6 +190,19 @@ def _extract_products(args: argparse.Namespace) -> int:
     return 0
 
 
+def _enrich_crawl(args: argparse.Namespace) -> int:
+    result = crawl_seed(
+        Settings.from_env(),
+        seed_path=args.seed,
+        limit=args.limit,
+        out_md=args.out,
+    )
+    print(
+        f"attempted={result.attempted} http_200={result.http_200} "
+        f"parsed={result.parsed} ({result.parse_rate:.2f}%) "
+        f"failed_com={result.failed_com} failed_uk={result.failed_uk} wrote {args.out}"
+    )
+    return 0
 def _write(path: str, text: str) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
