@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from src.config import Settings
+from src.enrich.extract_products import extract_products
 from src.enrich.ip_lookup import load_ip_geo
 from src.explore.profile import profile_tar
 from src.explore.render import render_data_dictionary, render_null_profile, render_quality_report
@@ -52,7 +53,13 @@ def main(argv: list[str] | None = None) -> int:
     ip_cmd.add_argument("--checkout-counts", default="data/staging/checkout_success_ips.tsv")
     ip_cmd.add_argument("--out", default="docs/ip_coverage.md")
     ip_cmd.set_defaults(handler=_enrich_ip)
-
+    extract_cmd = enrich_cmds.add_parser(
+        "extract-products",
+        help="Build one product URL per id from the coach event list",
+    )
+    extract_cmd.add_argument("--per-event", type=int, default=0, help="0 reads every document of each event.")
+    extract_cmd.add_argument("--out", default="data/exports/product_urls.csv")
+    extract_cmd.set_defaults(handler=_extract_products)
     args = parser.parse_args(argv)
     try:
         return int(args.handler(args))
@@ -154,6 +161,26 @@ def _enrich_ip(args: argparse.Namespace) -> int:
         f"checkout_success {coverage.checkout_pct:.2f}% "
         f"wrote {args.out}"
     )
+    return 0
+
+
+def _extract_products(args: argparse.Namespace) -> int:
+    from src.db import get_client
+
+    settings = Settings.from_env()
+    raw = get_client(settings)[settings.mongo_db][settings.mongo_collection_raw]
+    result = extract_products(
+        raw,
+        base_url=settings.crawl_base_url,
+        per_event=args.per_event,
+        out_csv=args.out,
+    )
+    print(
+        f"scanned={result.scanned:,} kept={result.kept:,} "
+        f"products={result.products:,} wrote {result.path}"
+    )
+    for event, (seen, kept) in result.by_event.items():
+        print(f"  {event}: scanned={seen:,} kept={kept:,}")
     return 0
 
 
