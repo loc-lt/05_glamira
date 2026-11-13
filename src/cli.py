@@ -9,6 +9,7 @@ from pathlib import Path
 
 from src.config import Settings
 from src.enrich.crawl import crawl_seed
+from src.enrich.export_csv import export_collection, product_status
 from src.enrich.extract_products import extract_products
 from src.enrich.ip_lookup import load_ip_geo
 from src.explore.profile import profile_tar
@@ -66,6 +67,14 @@ def main(argv: list[str] | None = None) -> int:
     crawl_cmd.add_argument("--limit", type=int, default=100, help="First N seed rows. 0 reads the whole seed.")
     crawl_cmd.add_argument("--out", default="docs/crawl_pilot.md")
     crawl_cmd.set_defaults(handler=_enrich_crawl)
+    export_cmd = enrich_cmds.add_parser("export-csv", help="Write ip_geo or products to CSV beside Mongo")
+    export_cmd.add_argument("collection", choices=("ip_geo", "products"))
+    export_cmd.add_argument("--out", default=None, help="Defaults to data/exports/<collection>.csv")
+    export_cmd.set_defaults(handler=_export_csv)
+    status_cmd = enrich_cmds.add_parser("product-status", help="Compare products in Mongo with the seed")
+    status_cmd.add_argument("--seed", default="data/exports/product_urls.csv")
+    status_cmd.set_defaults(handler=_product_status)
+
     args = parser.parse_args(argv)
     try:
         return int(args.handler(args))
@@ -203,6 +212,25 @@ def _enrich_crawl(args: argparse.Namespace) -> int:
         f"failed_com={result.failed_com} failed_uk={result.failed_uk} wrote {args.out}"
     )
     return 0
+
+
+def _export_csv(args: argparse.Namespace) -> int:
+    settings = Settings.from_env()
+    out = args.out or f"data/exports/{args.collection}.csv"
+    rows = export_collection(settings, args.collection, out)
+    print(f"wrote {out} ({rows:,} rows)")
+    return 0
+
+
+def _product_status(args: argparse.Namespace) -> int:
+    status = product_status(Settings.from_env(), args.seed)
+    print(
+        f"seed={status.seed:,} products={status.documents:,} named={status.named:,} "
+        f"({status.named_pct:.2f}%) missing_from_mongo={status.missing:,}"
+    )
+    return 0 if status.missing == 0 else 4
+
+
 def _write(path: str, text: str) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
