@@ -115,6 +115,24 @@ class ReactDataTest(unittest.TestCase):
         self.assertEqual(products.docs["7"]["name"], "Ring Seven")
         self.assertEqual(result.not_found, 0)
 
+    def test_startup_waits_when_mongo_is_unreachable(self) -> None:
+        from pymongo.errors import ServerSelectionTimeoutError
+
+        calls = {"n": 0}
+        real_done_ids = react.done_ids
+
+        def flaky(products, retry_missing=False):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ServerSelectionTimeoutError("firewall")
+            return real_done_ids(products, retry_missing)
+
+        uk = react.react_url("www.glamira.co.uk", "9")
+        with mock.patch.object(react, "done_ids", side_effect=flaky):
+            result, products = self.run_crawl({uk: [payload("Ring Nine")]}, ["9"])
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(products.docs["9"]["name"], "Ring Nine")
+
     def test_restart_skips_named_and_not_found(self) -> None:
         docs = [{"_id": "1", "name": "Done"}, {"_id": "2", "name": None, "not_found": True}]
         result, _ = self.run_crawl({}, ["1", "2", "3"], docs)

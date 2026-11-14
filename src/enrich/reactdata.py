@@ -184,6 +184,18 @@ def _fetch(tabs: _Tabs, host: str, product_id: str) -> dict:
         return {"status": 0, "error": f"{type(exc).__name__}: {exc}"[:180]}
 
 
+def _with_mongo_retry(label: str, action):
+    """Run a Mongo read; if the VM is unreachable (firewall, tunnel down), wait and retry."""
+    wait = 5
+    while True:
+        try:
+            return action()
+        except PyMongoError as exc:
+            print(f"[react] mongo unreachable during {label} ({type(exc).__name__}); retry in {wait}s", flush=True)
+            time.sleep(wait)
+            wait = min(wait * 2, MAX_BACKOFF)
+
+
 def _flush(products: Collection, ops: list[UpdateOne]) -> None:
     """Write the batch; if Mongo is unreachable, wait and retry instead of losing it."""
     wait = 5
@@ -210,7 +222,7 @@ def crawl_reactdata(
 ) -> ReactResult:
     products = get_client(settings)[settings.mongo_db][settings.mongo_collection_products]
     rows = read_seed(seed_path, limit)
-    finished = done_ids(products, retry_missing)
+    finished = _with_mongo_retry("startup", lambda: done_ids(products, retry_missing))
     pending = [row for row in rows if row[0] not in finished]
     result = ReactResult(skipped=len(rows) - len(pending))
     print(f"[react] seed={len(rows)} already done={result.skipped} pending={len(pending)}", flush=True)
@@ -291,7 +303,8 @@ def crawl_reactdata(
             pass
         if playwright is not None:
             playwright.stop()
-        _write_report(out_md, products, result, time.perf_counter() - started)
+        seconds = time.perf_counter() - started
+        _with_mongo_retry("report", lambda: _write_report(out_md, products, result, seconds))
     return result
 
 
