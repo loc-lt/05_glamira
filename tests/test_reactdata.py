@@ -29,12 +29,18 @@ class FakePage:
 class FakeBrowser:
     def __init__(self, script: dict) -> None:
         self.script = script
+        self.connected = True
 
     def new_page(self) -> FakePage:
+        if not self.connected:
+            raise RuntimeError("Browser.new_page: Target page, context or browser has been closed")
         return FakePage(self.script)
 
+    def is_connected(self) -> bool:
+        return self.connected
+
     def close(self) -> None:
-        pass
+        self.connected = False
 
 
 class FakeProducts:
@@ -132,6 +138,32 @@ class ReactDataTest(unittest.TestCase):
             result, products = self.run_crawl({uk: [payload("Ring Nine")]}, ["9"])
         self.assertEqual(calls["n"], 2)
         self.assertEqual(products.docs["9"]["name"], "Ring Nine")
+
+    def test_closed_browser_is_relaunched(self) -> None:
+        uk = react.react_url("www.glamira.co.uk", "11")
+        launched: list[FakeBrowser] = []
+        script = {uk: [{"status": 0, "error": "TargetClosedError: Page.evaluate: Target page, context or browser has been closed"},
+                       payload("Ring Eleven")]}
+
+        def factory() -> FakeBrowser:
+            browser = FakeBrowser(script)
+            if not launched:
+                browser.connected = False      # first Chrome dies: every new_page fails
+            launched.append(browser)
+            return browser
+
+        products = FakeProducts()
+        tmp = tempfile.mkdtemp()
+        seed = Path(tmp) / "seed.csv"
+        seed.write_text("product_id,canonical_url,source_event\n11,https://x/11.html,view_product_detail\n")
+        settings = Settings(None, None, "mongodb://fake", "glamira", "glamira_raw", "products",
+                            10000, 1.0, "https://www.glamira.co.uk", "ua")
+        with mock.patch.object(react, "get_client", return_value={"glamira": {"products": products}}), \
+                mock.patch.object(react.time, "sleep"):
+            react.crawl_reactdata(settings, seed_path=str(seed), out_md=str(Path(tmp) / "r.md"),
+                                  browser_factory=factory)
+        self.assertGreaterEqual(len(launched), 2)
+        self.assertEqual(products.docs["11"]["name"], "Ring Eleven")
 
     def test_restart_skips_named_and_not_found(self) -> None:
         docs = [{"_id": "1", "name": "Done"}, {"_id": "2", "name": None, "not_found": True}]

@@ -153,13 +153,26 @@ def missing_op(product_id: str, seed_url: str, status: int, error: str | None) -
 
 
 class _Tabs:
-    """One Chrome tab per host, opened on the host home page so the CDN cookies exist."""
+    """One Chrome tab per host, opened on the host home page so the CDN cookies exist.
 
-    def __init__(self, browser) -> None:
-        self.browser = browser
+    `launch` starts a browser. If Chrome is closed or crashes, `reset(restart=True)`
+    starts a new one; reopening tabs alone cannot work once the browser is gone.
+    """
+
+    def __init__(self, launch) -> None:
+        self.launch = launch
+        self.browser = launch()
         self.pages: dict[str, object] = {}
 
+    def _alive(self) -> bool:
+        try:
+            return bool(self.browser.is_connected())
+        except Exception:
+            return False
+
     def get(self, host: str):
+        if not self._alive():
+            self.reset(restart=True)
         page = self.pages.get(host)
         if page is None:
             page = self.browser.new_page()
@@ -167,13 +180,23 @@ class _Tabs:
             self.pages[host] = page
         return page
 
-    def reset(self) -> None:
+    def reset(self, restart: bool = False) -> None:
         for page in self.pages.values():
             try:
                 page.close()
             except Exception:
                 pass
         self.pages.clear()
+        if restart or not self._alive():
+            self.close_browser()
+            print("[react] restarting Chrome", flush=True)
+            self.browser = self.launch()
+
+    def close_browser(self) -> None:
+        try:
+            self.browser.close()
+        except Exception:
+            pass
 
 
 def _fetch(tabs: _Tabs, host: str, product_id: str) -> dict:
@@ -229,23 +252,40 @@ def crawl_reactdata(
     ops: list[UpdateOne] = []
     started = time.perf_counter()
 
+    # Adaptive politeness: slow down after CDN/network trouble, speed back up after a calm stretch.
+    slow = {"factor": 1.0, "calm": 0}
+
     def pause() -> None:
-        time.sleep(random.uniform(min_delay, max_delay))
+        time.sleep(random.uniform(min_delay, max_delay) * slow["factor"])
+
+    def calm() -> None:
+        slow["calm"] += 1
+        if slow["calm"] >= 50 and slow["factor"] > 1.0:
+            slow["factor"] = max(1.0, slow["factor"] / 1.5)
+            slow["calm"] = 0
+            print(f"[react] calm again, delay x{slow['factor']:.1f}", flush=True)
+
+    def trouble() -> None:
+        slow["calm"] = 0
+        if slow["factor"] < 4.0:
+            slow["factor"] = min(4.0, slow["factor"] * 1.5)
+            print(f"[react] slowing down, delay x{slow['factor']:.1f}", flush=True)
 
     playwright = None
-    browser = None
     if browser_factory is None:
         from playwright.sync_api import sync_playwright
 
         playwright = sync_playwright().start()
-        browser = playwright.chromium.launch(executable_path=_chrome_path(), headless=False)
-    else:
-        browser = browser_factory()
-    tabs = _Tabs(browser)
+
+        def browser_factory():
+            return playwright.chromium.launch(executable_path=_chrome_path(), headless=False)
+
+    tabs = _Tabs(browser_factory)
     try:
         for index, (product_id, seed_url) in enumerate(pending, start=1):
             outcome = None
             backoff = 5
+            failures = 0
             while outcome is None:
                 last = {"status": 0, "error": None}
                 transient = False
@@ -264,13 +304,21 @@ def crawl_reactdata(
                 if outcome is None:
                     print(
                         f"[react] {product_id} transient status={last.get('status')} "
-                        f"err={last.get('error')}; reopen tabs, retry in {backoff}s",
+                        f"err={last.get('error')}; reopen tabs/browser, retry in {backoff}s",
                         flush=True,
                     )
-                    tabs.reset()
+                    failures += 1
+                    trouble()
+                    closed = "closed" in str(last.get("error") or "").lower()
+                    try:
+                        tabs.reset(restart=closed or failures >= 2)
+                    except Exception as exc:  # Chrome could not start; wait and try again
+                        print(f"[react] could not restart Chrome: {type(exc).__name__}: {exc}"[:200], flush=True)
                     time.sleep(backoff)
                     backoff = min(backoff * 2, MAX_BACKOFF)
             result.attempted += 1
+            if failures == 0:
+                calm()
             if outcome[0] == "found":
                 _, host, fields = outcome
                 ops.append(found_op(product_id, host, seed_url, fields))
@@ -296,11 +344,12 @@ def crawl_reactdata(
         print("[react] interrupted; saving what is already fetched", flush=True)
     finally:
         _flush(products, ops)
-        tabs.reset()
-        try:
-            browser.close()
-        except Exception:
-            pass
+        for page in tabs.pages.values():
+            try:
+                page.close()
+            except Exception:
+                pass
+        tabs.close_browser()
         if playwright is not None:
             playwright.stop()
         seconds = time.perf_counter() - started
