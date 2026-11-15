@@ -36,6 +36,7 @@ _BLOCKED_NAMES = frozenset({"access denied", "forbidden", "just a moment", "oops
 _FLUSH_EVERY = 10
 _COM_ATTEMPTS = 3
 _UK_ATTEMPTS = 2
+_FINAL_STATUSES = frozenset({404, 410})
 
 
 @dataclass
@@ -185,6 +186,7 @@ def crawl_seed(
             page, status, parsed_page, error = _fetch_attempts(browser, page, seed_url, attempts=1)
             fetched_url = seed_url
             if not _usable(parsed_page):
+                pause()
                 page, status, parsed_page, error = _fetch_attempts(
                     browser, page, com_url, attempts=_COM_ATTEMPTS, pause=pause
                 )
@@ -284,7 +286,8 @@ def _fetch_attempts(
             page = _replace_page(browser, page)
             time.sleep(2)
             status, parsed_page, error = _fetch_one(page, url)
-        if _usable(parsed_page):
+        if _usable(parsed_page) or status in _FINAL_STATUSES:
+            # A 404/410 will not change on retry; stop instead of hitting the site again.
             return page, status, parsed_page, error
     return page, status, parsed_page, error
 
@@ -413,19 +416,37 @@ def _fetch_one(page: Page, url: str) -> tuple[int, ProductPage, str | None]:
         response = page.goto(url, wait_until="domcontentloaded", timeout=30_000)
     except Exception as exc:
         return 0, empty, f"{type(exc).__name__}: {exc}"[:180]
+    status = response.status if response is not None else 0
+    if status != 200:
+        # Check the status before waiting: a 404 page never satisfies _CATALOG_READY.
+        return status, empty, None
     if "/catalog/product/view/" in url:
         try:
             page.wait_for_function(_CATALOG_READY, timeout=20_000)
             page.wait_for_function(_CATALOG_PRODUCT, timeout=10_000)
         except Exception:
             pass
-    status = response.status if response is not None else 0
-    if status != 200:
-        return status, empty, None
-    parsed_page = parse_product_html(page.content())
+    html = _page_html(page)
+    if html is None:
+        return status, empty, "page kept navigating"
+    parsed_page = parse_product_html(html)
     if parsed_page.name is not None and parsed_page.name.casefold() in _BLOCKED_NAMES:
         return status, empty, "blocked"
     return status, parsed_page, None
+
+
+def _page_html(page: Page, tries: int = 3) -> str | None:
+    """Read the HTML; a JS redirect right after domcontentloaded makes content() fail."""
+    for _ in range(tries):
+        try:
+            page.wait_for_load_state("load", timeout=15_000)
+        except Exception:
+            pass
+        try:
+            return page.content()
+        except Exception:
+            time.sleep(1)
+    return None
 
 
 def _probe_http(url: str, user_agent: str) -> int:
@@ -435,7 +456,7 @@ def _probe_http(url: str, user_agent: str) -> int:
             return int(response.status)
     except urllib.error.HTTPError as exc:
         return int(exc.code)
-    except urllib.error.URLError:
+    except (urllib.error.URLError, OSError):
         return 0
 
 
