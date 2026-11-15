@@ -139,6 +139,21 @@ class ReactDataTest(unittest.TestCase):
         self.assertEqual(calls["n"], 2)
         self.assertEqual(products.docs["9"]["name"], "Ring Nine")
 
+    def test_single_blip_retries_in_same_tab(self) -> None:
+        uk = react.react_url("www.glamira.co.uk", "12")
+        script = {uk: [{"status": 0, "error": "TypeError: Failed to fetch"}, payload("Ring Twelve")]}
+        opened = {"pages": 0}
+        real_new_page = FakeBrowser.new_page
+
+        def counting_new_page(self):
+            opened["pages"] += 1
+            return real_new_page(self)
+
+        with mock.patch.object(FakeBrowser, "new_page", counting_new_page):
+            result, products = self.run_crawl(script, ["12"])
+        self.assertEqual(products.docs["12"]["name"], "Ring Twelve")
+        self.assertEqual(opened["pages"], 1)     # no tab was reopened for one blip
+
     def test_closed_browser_is_relaunched(self) -> None:
         uk = react.react_url("www.glamira.co.uk", "11")
         launched: list[FakeBrowser] = []

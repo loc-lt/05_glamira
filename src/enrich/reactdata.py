@@ -304,16 +304,21 @@ def crawl_reactdata(
                 if outcome is None:
                     print(
                         f"[react] {product_id} transient status={last.get('status')} "
-                        f"err={last.get('error')}; reopen tabs/browser, retry in {backoff}s",
+                        f"err={last.get('error')}; retry {failures + 1} in {backoff}s",
                         flush=True,
                     )
                     failures += 1
-                    trouble()
                     closed = "closed" in str(last.get("error") or "").lower()
-                    try:
-                        tabs.reset(restart=closed or failures >= 2)
-                    except Exception as exc:  # Chrome could not start; wait and try again
-                        print(f"[react] could not restart Chrome: {type(exc).__name__}: {exc}"[:200], flush=True)
+                    # Escalate step by step: a single blip is just retried in the same tab.
+                    # Reloading the home page is heavy and draws more CDN attention, so only
+                    # reopen tabs on the 2nd failure and restart Chrome from the 3rd (or if it died).
+                    if failures >= 2:
+                        trouble()
+                    if closed or failures >= 2:
+                        try:
+                            tabs.reset(restart=closed or failures >= 3)
+                        except Exception as exc:  # Chrome could not start; wait and try again
+                            print(f"[react] could not restart Chrome: {type(exc).__name__}: {exc}"[:200], flush=True)
                     time.sleep(backoff)
                     backoff = min(backoff * 2, MAX_BACKOFF)
             result.attempted += 1
