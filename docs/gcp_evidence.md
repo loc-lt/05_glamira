@@ -119,11 +119,36 @@ scanned=24,192,540 kept=21,942,848 products=19,093 wrote data/exports/product_ur
 
 ## Checkpoint 11 — products
 
+`uv run python -m src.cli enrich product-status --seed data/exports/product_urls.csv`:
+
 ```text
-# product-status output: expected missing_from_mongo=0
-# products countDocuments on the VM: expected 19093
-# number with a name:
-# gcloud storage ls gs://<bucket>/exports/products.csv
+seed=19,093 products=19,093 named=18,662 (97.74%) missing_from_mongo=0
 ```
 
-Not filled: crawl has not run. VM `products` count is currently `0`.
+- Products in Mongo (`glamira.product`): 19,093, one per seed id.
+- Products with a name: 18,662 (97.74%). The other 431 have no name because neither glamira.com nor glamira.co.uk returned one.
+
+`uv run python -m src.cli enrich export-csv products`:
+
+```text
+wrote data/exports/products.csv (19,093 rows)
+```
+
+## Exports on GCS
+
+`gcloud storage cp data/exports/ip_geo.csv data/exports/products.csv gs://glamira-raw-data-asia-southeast1-glamira-p05-loclt/exports/`:
+
+```text
+Copying file://data/exports/ip_geo.csv to gs://glamira-raw-data-asia-southeast1-glamira-p05-loclt/exports/ip_geo.csv
+Copying file://data/exports/products.csv to gs://glamira-raw-data-asia-southeast1-glamira-p05-loclt/exports/products.csv
+  Completed files 2/2 | 171.9MiB/171.9MiB
+```
+
+`gcloud storage ls -l gs://glamira-raw-data-asia-southeast1-glamira-p05-loclt/exports/`:
+
+```text
+ 172914573  2026-11-16T17:10:41Z  gs://glamira-raw-data-asia-southeast1-glamira-p05-loclt/exports/ip_geo.csv
+   1604005  2026-11-13T09:25:51Z  gs://glamira-raw-data-asia-southeast1-glamira-p05-loclt/exports/product_urls.csv
+   7343276  2026-11-16T17:10:39Z  gs://glamira-raw-data-asia-southeast1-glamira-p05-loclt/exports/products.csv
+TOTAL: 3 objects, 181861854 bytes (173.44MiB)
+```
