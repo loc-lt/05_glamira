@@ -2,8 +2,10 @@
 
 Endpoint: https://<host>/productcustomizer/reactdata/index/id/<product_id>/
 robots.txt explicitly allows /productcustomizer/reactdata/. Plain HTTP gets 403
-from the CDN, so each request is a fetch() inside one real Chrome tab per host:
-no HTML rendering, about 0.5 s per product instead of 5-10 s for a product page.
+from the CDN, so a real Chrome tab opens the JSON URL directly, exactly like typing
+it in the address bar: about 0.5 s per product instead of 5-10 s for a product page.
+(A fetch() issued from inside the home page was blocked by the CDN after the first
+call in each tab; a top-level navigation is not.)
 
 Progress lives in Mongo. Every product id ends with one document in `products`:
 a name (done) or `not_found: true` (removed from the store). A restart skips
@@ -16,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import random
 import sys
 import time
@@ -31,28 +34,45 @@ from src.config import Settings
 from src.db import get_client
 
 HOSTS = ("www.glamira.co.uk", "www.glamira.com")
+# Placeholder values the site uses when a product has no type (fees, test items).
+BAD_TYPES = frozenset({"--_select_--", "-1", "0", ""})
 CURRENCY = {"www.glamira.co.uk": "GBP"}
 FLUSH_EVERY = 10
 MAX_BACKOFF = 300
 
-# Runs inside the Chrome tab. Returns only the fields we keep, not the ~800 KB JSON.
-_FETCH_JS = """async (url) => {
-  let r;
-  try { r = await fetch(url, {credentials: 'include', headers: {'Accept': 'application/json'}}); }
-  catch (e) { return {status: 0, error: String(e).slice(0, 180)}; }
-  const text = await r.text();
-  let j = null;
-  try { j = JSON.parse(text); } catch (e) { return {status: r.status, error: 'not json'}; }
-  if (!r.ok || !j || j.error) return {status: r.status, error: (j && j.error) || ('http ' + r.status)};
-  const pp = j.product_price || {};
-  const images = (j.media_image || {}).images || [];
-  return {status: r.status, data: {
-    name: j.name, sku: j.sku, product_type: j.product_type, category_name: j.category_name,
-    collection: j.collection, gender: j.gender, attribute_set: j.attribute_set,
-    price: (pp.price !== undefined ? pp.price : j.price), currency: pp.currencyCode,
-    min_price: j.min_price, max_price: j.max_price,
-    image_url: images.length ? images[0].large_image_url : null, store_code: j.store_code}};
-}"""
+def extract_payload(payload: dict) -> dict:
+    """Keep only the fields we store from the ~300-800 KB reactdata JSON."""
+    price = payload.get("product_price") or {}
+    images = (payload.get("media_image") or {}).get("images") or []
+    first = images[0] if images and isinstance(images[0], dict) else {}
+    return {
+        "name": payload.get("name"),
+        "sku": payload.get("sku"),
+        "product_type": payload.get("product_type"),
+        "category_name": payload.get("category_name"),
+        "collection": payload.get("collection"),
+        "gender": payload.get("gender"),
+        "attribute_set": payload.get("attribute_set"),
+        "price": price.get("price", payload.get("price")),
+        "currency": price.get("currencyCode"),
+        "min_price": payload.get("min_price"),
+        "max_price": payload.get("max_price"),
+        "image_url": first.get("large_image_url"),
+        "store_code": payload.get("store_code"),
+    }
+
+
+def parse_response(status: int, body: bytes) -> dict:
+    """Turn one HTTP answer into {status, data} or {status, error}."""
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return {"status": status, "error": "not json"}
+    if not isinstance(payload, dict):
+        return {"status": status, "error": "not json"}
+    if status != 200 or payload.get("error"):
+        return {"status": status, "error": payload.get("error") or f"http {status}"}
+    return {"status": status, "data": extract_payload(payload)}
 
 
 @dataclass
@@ -79,6 +99,8 @@ def react_fields(data: dict) -> dict:
         return out or None
 
     product_type = text(data.get("product_type"))
+    if product_type in BAD_TYPES:
+        product_type = None
     return {
         "name": text(data.get("name")),
         "category": product_type or text(data.get("category_name")),
@@ -103,11 +125,21 @@ def is_transient(status: int, error: str | None) -> bool:
     return status == 0 or status == 403 or status == 429 or status >= 500 or error == "not json"
 
 
-def done_ids(products: Collection, retry_missing: bool = False) -> set[str]:
-    query: dict = {"name": {"$type": "string", "$ne": ""}}
-    if not retry_missing:
-        query = {"$or": [query, {"not_found": True}]}
-    return {str(doc["_id"]) for doc in products.find(query, {"_id": 1})}
+def done_ids(products: Collection, retry_missing: bool = False, refresh_old: bool = False) -> set[str]:
+    """Ids to skip. `refresh_old` re-asks products that came from the old HTML crawl
+    (no `source`) or carry a placeholder category, so `category` ends up uniform."""
+    done: set[str] = set()
+    fields = {"_id": 1, "name": 1, "not_found": 1, "source": 1, "category": 1}
+    for doc in products.find({}, fields):
+        name = doc.get("name")
+        if isinstance(name, str) and name.strip():
+            stale = doc.get("source") != "reactdata" or doc.get("category") in BAD_TYPES
+            if refresh_old and stale:
+                continue
+            done.add(str(doc["_id"]))
+        elif doc.get("not_found") is True and not retry_missing:
+            done.add(str(doc["_id"]))
+    return done
 
 
 def read_seed(path: str, limit: int) -> list[tuple[str, str]]:
@@ -153,7 +185,7 @@ def missing_op(product_id: str, seed_url: str, status: int, error: str | None) -
 
 
 class _Tabs:
-    """One Chrome tab per host, opened on the host home page so the CDN cookies exist.
+    """One Chrome tab per host. Each request is a top-level navigation to the JSON URL.
 
     `launch` starts a browser. If Chrome is closed or crashes, `reset(restart=True)`
     starts a new one; reopening tabs alone cannot work once the browser is gone.
@@ -176,7 +208,6 @@ class _Tabs:
         page = self.pages.get(host)
         if page is None:
             page = self.browser.new_page()
-            page.goto(f"https://{host}/", wait_until="domcontentloaded", timeout=60_000)
             self.pages[host] = page
         return page
 
@@ -200,10 +231,14 @@ class _Tabs:
 
 
 def _fetch(tabs: _Tabs, host: str, product_id: str) -> dict:
+    """Open the JSON URL in the host tab (like the address bar) and parse the answer."""
     try:
         page = tabs.get(host)
-        return page.evaluate(_FETCH_JS, react_url(host, product_id))
-    except Exception as exc:  # tab crashed, navigation, network down while opening the home page
+        response = page.goto(react_url(host, product_id), wait_until="commit", timeout=60_000)
+        if response is None:
+            return {"status": 0, "error": "no response"}
+        return parse_response(response.status, response.body())
+    except Exception as exc:  # tab or browser closed, network down
         return {"status": 0, "error": f"{type(exc).__name__}: {exc}"[:180]}
 
 
@@ -240,12 +275,13 @@ def crawl_reactdata(
     min_delay: float = 1.0,
     max_delay: float = 2.0,
     retry_missing: bool = False,
+    refresh_old: bool = False,
     out_md: str = "docs/crawl_react.md",
     browser_factory=None,
 ) -> ReactResult:
     products = get_client(settings)[settings.mongo_db][settings.mongo_collection_products]
     rows = read_seed(seed_path, limit)
-    finished = _with_mongo_retry("startup", lambda: done_ids(products, retry_missing))
+    finished = _with_mongo_retry("startup", lambda: done_ids(products, retry_missing, refresh_old))
     pending = [row for row in rows if row[0] not in finished]
     result = ReactResult(skipped=len(rows) - len(pending))
     print(f"[react] seed={len(rows)} already done={result.skipped} pending={len(pending)}", flush=True)
@@ -386,11 +422,16 @@ def _write_report(path: str, products: Collection, run: ReactResult, seconds: fl
         f"| With a name | {named:,} |",
         f"| Not found (removed from the store) | {missing:,} |",
         "",
-        "| Category (`product_type`) this run | Products |",
+        "| Category (`product_type`), whole collection | Products |",
         "|---|---:|",
     ]
-    for kind, count in sorted(run.by_type.items(), key=lambda item: -item[1]):
-        lines.append(f"| `{kind}` | {count:,} |")
+    by_category = products.aggregate([
+        {"$match": {"name": {"$type": "string", "$ne": ""}}},
+        {"$group": {"_id": "$category", "n": {"$sum": 1}}},
+        {"$sort": {"n": -1}},
+    ])
+    for row in by_category:
+        lines.append(f"| `{row['_id'] or '?'}` | {row['n']:,} |")
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -410,8 +451,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-delay", type=float, default=1.0, help="Seconds between requests (random).")
     parser.add_argument("--max-delay", type=float, default=2.0)
     parser.add_argument("--retry-missing", action="store_true", help="Ask again for ids marked not_found.")
+    parser.add_argument("--refresh-old", action="store_true",
+                        help="Re-ask products from the old HTML crawl or with a placeholder category.")
     parser.add_argument("--out", default="docs/crawl_react.md")
+    parser.add_argument("--report-only", action="store_true",
+                        help="Rewrite the report from Mongo only: no Chrome, no requests to the site.")
     args = parser.parse_args(argv)
+    if args.report_only:
+        settings = Settings.from_env()
+        products = get_client(settings)[settings.mongo_db][settings.mongo_collection_products]
+        _with_mongo_retry("report", lambda: _write_report(args.out, products, ReactResult(), 0.0))
+        print(f"wrote {args.out}")
+        return 0
     result = crawl_reactdata(
         Settings.from_env(),
         seed_path=args.seed,
@@ -419,6 +470,7 @@ def main(argv: list[str] | None = None) -> int:
         min_delay=args.min_delay,
         max_delay=args.max_delay,
         retry_missing=args.retry_missing,
+        refresh_old=args.refresh_old,
         out_md=args.out,
     )
     print(

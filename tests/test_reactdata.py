@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,16 +12,35 @@ import src.enrich.reactdata as react
 from src.config import Settings
 
 
+class FakeResponse:
+    def __init__(self, status: int, body: bytes) -> None:
+        self.status = status
+        self._body = body
+
+    def body(self) -> bytes:
+        return self._body
+
+
 class FakePage:
+    """Plays a script of answers per URL; the last answer repeats."""
+
     def __init__(self, script: dict) -> None:
         self.script = script
 
-    def goto(self, url: str, **kwargs) -> None:
-        pass
-
-    def evaluate(self, js: str, url: str) -> dict:
+    def goto(self, url: str, **kwargs) -> FakeResponse:
         queue = self.script.setdefault(url, [{"status": 404, "error": "Product not found"}])
-        return queue.pop(0) if len(queue) > 1 else queue[0]
+        answer = queue.pop(0) if len(queue) > 1 else queue[0]
+        if answer["status"] == 0:
+            raise RuntimeError(answer["error"])
+        if "data" in answer:
+            d = answer["data"]
+            raw = {"name": d.get("name"), "sku": d.get("sku"), "product_type": d.get("product_type"),
+                   "category_name": d.get("category_name"),
+                   "product_price": {"price": d.get("price"), "currencyCode": d.get("currency")}}
+            return FakeResponse(answer["status"], json.dumps(raw).encode())
+        if answer.get("error") == "Product not found":
+            return FakeResponse(answer["status"], b'{"error":"Product not found"}')
+        return FakeResponse(answer["status"], b"<html>Service Unavailable</html>")
 
     def close(self) -> None:
         pass
@@ -48,6 +68,8 @@ class FakeProducts:
         self.docs = {d["_id"]: dict(d) for d in docs or []}
 
     def find(self, query: dict, projection: dict) -> list[dict]:
+        if not query:
+            return list(self.docs.values())
         def named(d: dict) -> bool:
             return isinstance(d.get("name"), str) and d["name"] != ""
 
@@ -67,6 +89,13 @@ class FakeProducts:
 
     def count_documents(self, query: dict) -> int:
         return len(self.docs)
+
+    def aggregate(self, pipeline: list) -> list[dict]:
+        counts: dict = {}
+        for d in self.docs.values():
+            if isinstance(d.get("name"), str) and d["name"]:
+                counts[d.get("category")] = counts.get(d.get("category"), 0) + 1
+        return [{"_id": k, "n": v} for k, v in sorted(counts.items(), key=lambda kv: -kv[1])]
 
 
 def payload(name: str, kind: str = "ring") -> dict:
@@ -94,6 +123,15 @@ class ReactDataTest(unittest.TestCase):
         fields = react.react_fields(payload("Engagement Ring Palmier")["data"])
         self.assertEqual((fields["name"], fields["category"], fields["currency"]),
                          ("Engagement Ring Palmier", "ring", "GBP"))
+
+    def test_parse_response_cases(self) -> None:
+        ok = react.parse_response(200, json.dumps({"name": "Ring", "product_type": "ring",
+                                                    "product_price": {"price": "851", "currencyCode": "GBP"},
+                                                    "media_image": {"images": [{"large_image_url": "https://img"}]}}).encode())
+        self.assertEqual((ok["data"]["name"], ok["data"]["currency"], ok["data"]["image_url"]), ("Ring", "GBP", "https://img"))
+        self.assertEqual(react.parse_response(404, b'{"error":"Product not found"}')["error"], "Product not found")
+        blocked = react.parse_response(403, b"<html>Access Denied</html>")
+        self.assertTrue(react.is_transient(blocked["status"], blocked["error"]))
 
     def test_url_adds_currency_only_for_uk(self) -> None:
         self.assertTrue(react.react_url("www.glamira.co.uk", "1").endswith("/id/1/?currency=GBP"))
@@ -127,11 +165,11 @@ class ReactDataTest(unittest.TestCase):
         calls = {"n": 0}
         real_done_ids = react.done_ids
 
-        def flaky(products, retry_missing=False):
+        def flaky(products, retry_missing=False, refresh_old=False):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise ServerSelectionTimeoutError("firewall")
-            return real_done_ids(products, retry_missing)
+            return real_done_ids(products, retry_missing, refresh_old)
 
         uk = react.react_url("www.glamira.co.uk", "9")
         with mock.patch.object(react, "done_ids", side_effect=flaky):
@@ -179,6 +217,19 @@ class ReactDataTest(unittest.TestCase):
                                   browser_factory=factory)
         self.assertGreaterEqual(len(launched), 2)
         self.assertEqual(products.docs["11"]["name"], "Ring Eleven")
+
+    def test_placeholder_type_becomes_null(self) -> None:
+        for bad in ("--_select_--", "-1"):
+            self.assertIsNone(react.react_fields({"name": "Shipping Label Fee", "product_type": bad})["category"])
+
+    def test_refresh_old_reasks_html_crawl_and_bad_category(self) -> None:
+        docs = [{"_id": "1", "name": "From HTML", "category": "Jewellery / Rings"},          # old crawl
+                {"_id": "2", "name": "Fee", "category": "--_select_--", "source": "reactdata"},
+                {"_id": "3", "name": "Good", "category": "ring", "source": "reactdata"},
+                {"_id": "4", "name": None, "not_found": True, "source": "reactdata"}]
+        products = FakeProducts(docs)
+        self.assertEqual(react.done_ids(products), {"1", "2", "3", "4"})
+        self.assertEqual(react.done_ids(products, refresh_old=True), {"3", "4"})
 
     def test_restart_skips_named_and_not_found(self) -> None:
         docs = [{"_id": "1", "name": "Done"}, {"_id": "2", "name": None, "not_found": True}]
